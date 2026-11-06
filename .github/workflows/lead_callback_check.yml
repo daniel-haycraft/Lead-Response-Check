@@ -4,7 +4,7 @@ on:
   schedule:
     # 6:00pm America/Phoenix, Mon-Fri. Arizona has no DST, so 6pm AZ is always 01:00 UTC the next day,
     # which is why the day-of-week field is Tue-Sat in UTC.
-    - cron: "17 1 * * 2-6"
+    - cron: "22 1 * * 2-6"
   workflow_dispatch:
     inputs:
       dry_run:
