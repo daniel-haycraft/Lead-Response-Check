@@ -91,7 +91,7 @@ import requests
 
 # --- HubSpot ---
 HUBSPOT_TOKEN = os.environ.get("HUBSPOT_TOKEN", "")
-LIST_ID = os.environ.get("HUBSPOT_LIST_ID", "19329")        # "Form Submissions Today"
+LIST_ID = "19329"        # "Form Submissions Today"
 PORTAL_ID = os.environ.get("HUBSPOT_PORTAL_ID", "6624066")  # only used to build record links
 
 # --- Google Sheets ---
