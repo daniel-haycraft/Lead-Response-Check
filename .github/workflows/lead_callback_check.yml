@@ -2,9 +2,9 @@ name: Lead Callback Check
 
 on:
   schedule:
-    # 6:00pm America/Phoenix, Mon-Fri. Arizona has no DST, so 6pm AZ is always 01:00 UTC the next day,
+    # 5:00pm America/Phoenix, Mon-Fri. Arizona has no DST, so 5pm AZ is always 00:00 UTC the next day,
     # which is why the day-of-week field is Tue-Sat in UTC.
-    - cron: "22 1 * * 2-6"
+    - cron: "42 1 * * 2-6"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -45,5 +45,7 @@ jobs:
           BUSINESS_START: ${{ vars.BUSINESS_START || '8' }}
           BUSINESS_END: ${{ vars.BUSINESS_END || '17' }}
           RECHECK_DAYS: ${{ vars.RECHECK_DAYS || '7' }}
+          REPORT_DAY_ONLY: ${{ vars.REPORT_DAY_ONLY || 'true' }}
+          EXCLUDE_FORMS: ${{ vars.EXCLUDE_FORMS || 'Credit Auth' }}
 
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
