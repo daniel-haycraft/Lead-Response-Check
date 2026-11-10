@@ -2,7 +2,7 @@ name: Lead Callback Check
 
 on:
   schedule:
-    # 5:00pm America/Phoenix, Mon-Fri. Arizona has no DST, so 5pm AZ is always 00:00 UTC the next day,
+    # 6:42pm America/Phoenix, Mon-Fri. Arizona has no DST, so 6:42pm AZ is always 01:42 UTC the next day,
     # which is why the day-of-week field is Tue-Sat in UTC.
     - cron: "42 1 * * 2-6"
   workflow_dispatch:
@@ -49,3 +49,11 @@ jobs:
           EXCLUDE_FORMS: ${{ vars.EXCLUDE_FORMS || 'Credit Auth' }}
 
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          DRY_RUN_HTML: email_preview.html
+
+      - name: Save email preview (dry run only)
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: email-preview
+          path: email_preview.html
