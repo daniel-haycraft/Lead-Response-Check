@@ -7,12 +7,12 @@
 WHAT THIS DOES
 --------------
 Runs once at the end of each business day and answers one question for every
-lead that came in today: "did a loan officer call this person, and how fast?"
+lead that came in: "did a loan officer call this person, and how fast?"
 
 The flow, top to bottom:
 
-    1. HubSpot list  ->  who submitted a form today, and WHEN they were added
-                         to the list. That add time is the "lead time".
+    1. HubSpot list  ->  who submitted a form, and WHEN they were added to the
+                         list. That add time is the "lead time".
     2. Google Sheet  ->  any leads from previous days that are still marked
                          NOT CALLED get pulled back in and re-checked.
     3. HubSpot       ->  for each lead, pull the calls logged on the contact
@@ -22,13 +22,21 @@ The flow, top to bottom:
                          No call at all = NOT CALLED.
     5. Google Sheet  ->  one row per lead. Existing rows (same contact + same
                          lead time) are updated in place, new ones appended.
-    6. Email         ->  the NOT CALLED list grouped by contact owner, plus a
-                         short "called but late" section, sent via Gmail SMTP.
+    6. Email         ->  styled HTML report in two parts:
+                           - the report day's leads (grouped by owner: not called,
+                             then called late, then a one-liner for on-time)
+                           - the backlog: anyone from earlier days still uncalled
+
+REPORT DAY
+----------
+The "report day" is the business day being scored. Normally that's today, but
+if GitHub runs the job late (after midnight, before the office opens) it's
+yesterday. Weekend and after-hours leads roll into the next business day,
+because the rep couldn't have called before the office opened anyway. So a
+Monday report covers Friday 5pm through Monday close.
 
 HOW TO READ THIS FILE
 ---------------------
-The file is split into sections with big banner comments:
-
     Config            all the knobs, read from environment variables
     Small helpers     date parsing/formatting and the business-hours math
     HubSpot           every call to the HubSpot API lives here
@@ -37,16 +45,8 @@ The file is split into sections with big banner comments:
     Email             builds the HTML and sends it
     Main              glues the sections together in order
 
-If you want to change a rule (what counts as a call, the tier cutoffs, the
-business hours), it's almost always in Config, tier_for(), or get_calls_after().
-
 ENVIRONMENT VARIABLES
 ---------------------
-Set as GitHub Secrets / Variables (see README.md), or exported in your shell
-for a local run. Only HUBSPOT_TOKEN is strictly required. If the Google or
-Gmail variables are missing the script logs a warning and skips that step
-instead of crashing, so you can test HubSpot on its own.
-
     HUBSPOT_TOKEN                private app token               (secret)
     GOOGLE_SERVICE_ACCOUNT_JSON  service account key file, as text (secret)
     GOOGLE_SHEET_ID              the ID in the sheet URL         (secret)
@@ -58,26 +58,28 @@ instead of crashing, so you can test HubSpot on its own.
     TIMEZONE           default America/Phoenix
     BUSINESS_START     default 8             BUSINESS_END       default 17
     RECHECK_DAYS       default 7             DRY_RUN            default false
+    EXCLUDE_FORMS      default "Credit Auth" (comma-separated, case-insensitive
+                       substring match on the Form / Event column)
+    REPORT_DAY_ONLY    default true (only score list members whose lead time
+                       falls in the report day window; older ones come back
+                       through the sheet carry-forward instead)
 """
 
 # --------------------------------------------------------------------------- #
 # Imports
 # --------------------------------------------------------------------------- #
-# Standard library only, except `requests` (HTTP) and, lazily, `gspread` +
-# `google-auth` for Sheets. The Google imports live inside open_sheet() so a
-# dry run that never touches Sheets doesn't need them installed.
 
-import json                 # building API request bodies, reading the SA key
-import logging              # progress output you'll see in the Actions log
-import os                   # environment variables
-import smtplib              # sending the email over SMTP
-import sys                  # sys.exit on fatal config problems
-import time                 # small sleeps between API calls
+import json
+import logging
+import os
+import smtplib
+import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as dtime          # renamed so it doesn't clash with the `time` module
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from zoneinfo import ZoneInfo               # timezone handling (Python 3.9+)
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -85,24 +87,21 @@ import requests
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
-# os.environ.get("NAME", "fallback") reads an env var and uses the fallback if
-# it isn't set. Nothing is hard-coded below that you can't override from the
-# GitHub repo's Secrets/Variables pages.
 
 # --- HubSpot ---
 HUBSPOT_TOKEN = os.environ.get("HUBSPOT_TOKEN", "")
-LIST_ID = "19329"        # "Form Submissions Today"
+LIST_ID = os.environ.get("HUBSPOT_LIST_ID", "19329")        # "Form Submissions Today"
 PORTAL_ID = os.environ.get("HUBSPOT_PORTAL_ID", "6624066")  # only used to build record links
 
 # --- Google Sheets ---
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 SHEET_TAB = os.environ.get("SHEET_TAB", "Master")
+SHEET_URL = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/edit" if GOOGLE_SHEET_ID else ""
 
 # --- Email ---
 GMAIL_USER = os.environ.get("GMAIL_USER", "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
-# EMAIL_TO can be "a@x.com,b@x.com". Split on commas, strip spaces, drop blanks.
 EMAIL_TO = [e.strip() for e in os.environ.get("EMAIL_TO", "daniel.haycraft@capitalfund1.com").split(",") if e.strip()]
 
 # --- Business-hours clock ---
@@ -113,35 +112,33 @@ WORKDAYS = {0, 1, 2, 3, 4}                                    # Python weekday()
 DAY_HOURS = BUSINESS_END - BUSINESS_START                     # 9 hours = "one full business day"
 
 # --- Behaviour ---
-RECHECK_DAYS = int(os.environ.get("RECHECK_DAYS", "7"))       # keep re-checking NOT CALLED leads this many days
+RECHECK_DAYS = int(os.environ.get("RECHECK_DAYS", "7"))
+REPORT_DAY_ONLY = os.environ.get("REPORT_DAY_ONLY", "true").strip().lower() in ("1", "true", "yes")
+EXCLUDE_FORMS = [s.strip().lower() for s in os.environ.get("EXCLUDE_FORMS", "Credit Auth").split(",") if s.strip()]
 DRY_RUN = os.environ.get("DRY_RUN", "false").strip().lower() in ("1", "true", "yes")
 
-# Logging goes to stdout, which is what you see in the GitHub Actions log.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("lead_callback_check")
 
-# One requests.Session so the auth header is set once and TCP connections are reused.
 HS_BASE = "https://api.hubapi.com"
 SESSION = requests.Session()
 SESSION.headers.update({"Authorization": f"Bearer {HUBSPOT_TOKEN}", "Content-Type": "application/json"})
 
-# Contact properties we ask HubSpot for. Internal names, not labels.
 CONTACT_PROPERTIES = [
     "firstname", "lastname", "email", "phone", "mobilephone",
     "hubspot_owner_id", "hs_lead_status", "sales_lead_source_2_0", "contact_type_2_0",
     "createdate", "recent_conversion_date", "recent_conversion_event_name",
     "heyflow_date", "heyflow_form", "hs_object_source_detail_1",
-    "hs_time_to_first_engagement",   # HubSpot's own "Lead response time", kept as a sanity-check column
+    "hs_time_to_first_engagement",
 ]
 
-# Call engagement properties. hs_timestamp is when the call happened (not when it was logged).
 CALL_PROPERTIES = [
     "hs_timestamp", "hs_call_direction", "hs_call_status", "hs_call_disposition",
     "hs_call_title", "hs_call_duration", "hubspot_owner_id", "hs_createdate",
 ]
 
-# Column order in the Google Sheet. The keys in evaluate()'s result dict must
-# match these exactly, because write_results() looks values up by header name.
+# Column order in the Google Sheet. evaluate()'s result dict uses these exact keys
+# (plus a few private "_" keys for the email that never get written to the sheet).
 SHEET_HEADERS = [
     "Run Date", "Lead Added At", "Contact ID", "Name", "Email", "Phone",
     "Contact Owner", "Lead Status", "Lead Source", "Form / Event", "Recent Conversion Date",
@@ -150,9 +147,33 @@ SHEET_HEADERS = [
     "HS Lead Response Time (hrs)", "HubSpot Link", "Last Checked",
 ]
 
-# How datetimes are written to the sheet. Also used to read them back, so don't
-# change one without the other (they're the same constant on purpose).
 DT_FMT = "%Y-%m-%d %H:%M:%S"
+
+# Tier labels and the colours the email uses for them.
+TIER_OK = "OK (<1h)"
+TIER_1 = "Flag 1 (1-3h)"
+TIER_2 = "Flag 2 (3h+)"
+TIER_3 = "Flag 3 (1+ biz day)"
+TIER_AFTER_HOURS = "After hours (clock not started)"
+
+TIER_STYLE = {   # background, text colour, short label for the pill
+    TIER_OK:          ("#2E7D32", "#FFFFFF", "On time"),
+    TIER_1:           ("#F9A825", "#1B1B1B", "Flag 1"),
+    TIER_2:           ("#EF6C00", "#FFFFFF", "Flag 2"),
+    TIER_3:           ("#C62828", "#FFFFFF", "Flag 3"),
+    TIER_AFTER_HOURS: ("#90A4AE", "#FFFFFF", "After hrs"),
+}
+
+# Email palette. Swap these for CF1 brand colours if you want.
+C_HEADER_BG = "#1F3A5F"
+C_HEADER_TEXT = "#FFFFFF"
+C_PAGE_BG = "#F2F4F7"
+C_CARD_BG = "#FFFFFF"
+C_TEXT = "#1B1B1B"
+C_MUTED = "#6B7280"
+C_LINE = "#E5E7EB"
+C_OWNER_BG = "#EEF2F7"
+C_LINK = "#1F3A5F"
 
 
 # --------------------------------------------------------------------------- #
@@ -166,13 +187,8 @@ def now_tz() -> datetime:
 
 def parse_hs_datetime(value):
     """
-    Turn a HubSpot date value into an aware datetime, or None.
-
-    HubSpot is inconsistent: the CRM API returns ISO strings like
-    '2026-11-02T15:00:14.907Z', while some properties (and the lists API in
-    older versions) return epoch milliseconds as a string like '1793491200000'.
-    This handles both. The 'Z' suffix is swapped for '+00:00' because
-    datetime.fromisoformat() didn't accept 'Z' before Python 3.11.
+    HubSpot date value -> aware datetime, or None.
+    Handles ISO strings ('2026-11-02T15:00:14.907Z') and epoch-ms strings ('1793491200000').
     """
     if value in (None, ""):
         return None
@@ -188,14 +204,25 @@ def parse_hs_datetime(value):
 
 
 def fmt_dt(dt) -> str:
-    """Aware datetime -> 'YYYY-MM-DD HH:MM:SS' in Arizona time. Empty string for None."""
+    """Aware datetime -> 'YYYY-MM-DD HH:MM:SS' in TZ. Empty string for None. Used for the sheet."""
     if not dt:
         return ""
     return dt.astimezone(TZ).strftime(DT_FMT)
 
 
+def fmt_short(dt, with_date=False) -> str:
+    """Human time for the email: 'Mon 9:39am', or 'Tue 11/3 2:28pm' with_date=True."""
+    if not dt:
+        return ""
+    dt = dt.astimezone(TZ)
+    t = dt.strftime("%I:%M%p").lstrip("0").lower()
+    if with_date:
+        return f"{dt.strftime('%a')} {dt.month}/{dt.day} {t}"
+    return f"{dt.strftime('%a')} {t}"
+
+
 def parse_sheet_dt(s: str):
-    """The reverse of fmt_dt(): read a sheet cell back into an aware datetime. None if it won't parse."""
+    """Reverse of fmt_dt(): sheet cell -> aware datetime, or None."""
     try:
         return datetime.strptime(s.strip(), DT_FMT).replace(tzinfo=TZ)
     except Exception:
@@ -204,18 +231,9 @@ def parse_sheet_dt(s: str):
 
 def business_hours_between(start: datetime, end: datetime) -> float:
     """
-    Business hours between two datetimes, as a float (e.g. 2.5).
-
-    Only counts time inside BUSINESS_START-BUSINESS_END on WORKDAYS, in TZ.
-    Walks day by day from start to end; for each workday it clips the
-    [start, end] window to that day's [open, close] window and adds whatever
-    overlap is left.
-
-    Examples with 8-5 Mon-Fri:
-        Mon 10:00 -> Mon 14:00        = 4.0
-        Fri 19:00 -> Mon 09:00        = 1.0   (Friday evening and weekend don't count)
-        Mon 16:00 -> Tue 09:00        = 2.0   (1h Monday + 1h Tuesday)
-        Mon 08:00 -> Tue 08:00        = 9.0   (exactly one business day)
+    Business hours (float) between two datetimes, counting only
+    BUSINESS_START-BUSINESS_END on WORKDAYS in TZ. Walks day by day and adds
+    the overlap of [start, end] with each workday's [open, close].
     """
     if not start or not end or end <= start:
         return 0.0
@@ -227,8 +245,8 @@ def business_hours_between(start: datetime, end: datetime) -> float:
         if day.weekday() in WORKDAYS:
             opens = datetime.combine(day, dtime(BUSINESS_START), tzinfo=TZ)
             closes = datetime.combine(day, dtime(BUSINESS_END), tzinfo=TZ)
-            s = max(start, opens)   # later of "lead came in" and "office opened"
-            e = min(end, closes)    # earlier of "call happened" and "office closed"
+            s = max(start, opens)
+            e = min(end, closes)
             if e > s:
                 total += (e - s).total_seconds() / 3600.0
         day += timedelta(days=1)
@@ -236,47 +254,54 @@ def business_hours_between(start: datetime, end: datetime) -> float:
 
 
 def tier_for(hours: float) -> str:
-    """
-    Bucket a business-hour count into a tier label.
-
-    Used two ways:
-      - for CALLED leads, `hours` is lead time -> first call
-      - for NOT CALLED leads, `hours` is lead time -> now (how overdue they are)
-
-    Change the cutoffs here if the rules change.
-    """
+    """Bucket a business-hour count into a tier label. Change the cutoffs here."""
     if hours < 1:
-        return "OK (<1h)"
+        return TIER_OK
     if hours < 3:
-        return "Flag 1 (1-3h)"
+        return TIER_1
     if hours < DAY_HOURS:
-        return "Flag 2 (3h+)"
-    return "Flag 3 (1+ biz day)"
+        return TIER_2
+    return TIER_3
+
+
+def report_day_for(run_at: datetime) -> date:
+    """
+    Which business day this run is reporting on.
+    - Before the office opens -> yesterday (GitHub ran us late).
+    - Weekend -> the previous Friday.
+    """
+    d = run_at.astimezone(TZ).date()
+    if run_at.astimezone(TZ).hour < BUSINESS_START:
+        d -= timedelta(days=1)
+    while d.weekday() not in WORKDAYS:
+        d -= timedelta(days=1)
+    return d
+
+
+def previous_business_close(day: date) -> datetime:
+    """Closing time of the last workday before `day`. Leads after this belong to `day`."""
+    p = day - timedelta(days=1)
+    while p.weekday() not in WORKDAYS:
+        p -= timedelta(days=1)
+    return datetime.combine(p, dtime(BUSINESS_END), tzinfo=TZ)
+
+
+def is_excluded(source: str) -> bool:
+    """True if the Form / Event text matches anything in EXCLUDE_FORMS."""
+    s = (source or "").lower()
+    return any(x in s for x in EXCLUDE_FORMS)
 
 
 def hs_link(contact_id) -> str:
-    """Clickable link to the contact record in HubSpot."""
     return f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-1/{contact_id}"
 
 
 # --------------------------------------------------------------------------- #
 # HubSpot
 # --------------------------------------------------------------------------- #
-# All HubSpot traffic goes through hs_request() so retries and error handling
-# live in one place. The functions below each wrap one endpoint.
 
 def hs_request(method: str, path: str, **kwargs):
-    """
-    Make one HubSpot API call and return the parsed JSON.
-
-    Handles the two things that bite you in a scheduled job:
-      - 429 Too Many Requests: sleep for the Retry-After header and try again
-      - 5xx server errors: back off a little and retry (up to 6 attempts)
-    Anything else that isn't 2xx raises with the response body in the message
-    so the Actions log tells you exactly what HubSpot complained about.
-
-    `kwargs` are passed straight to requests (params=..., data=...).
-    """
+    """One HubSpot API call with retries on 429 and 5xx. Raises on other errors with the body in the message."""
     url = f"{HS_BASE}{path}"
     for attempt in range(6):
         resp = SESSION.request(method, url, timeout=30, **kwargs)
@@ -297,16 +322,8 @@ def hs_request(method: str, path: str, **kwargs):
 
 def get_list_memberships(list_id: str) -> dict:
     """
-    Everyone currently in the list, with the moment they were added.
-
-    Endpoint: GET /crm/v3/lists/{listId}/memberships/join-order
-    Each result looks like {"recordId": "259736052305", "membershipTimestamp": "2026-11-02T15:00:14.907Z"}.
-    That timestamp is our lead time. It's the same source for HubSpot forms and
-    Heyflow, which is why we use it instead of per-form date properties.
-
-    Paginated: HubSpot returns up to 250 per page and a paging.next.after
-    cursor when there's more. Loop until there isn't one.
-
+    Everyone in the list with the moment they were added (the lead time).
+    GET /crm/v3/lists/{listId}/memberships/join-order, paginated.
     Returns {contact_id (str): added_at (aware datetime)}.
     """
     members = {}
@@ -327,15 +344,7 @@ def get_list_memberships(list_id: str) -> dict:
 
 
 def get_contacts(contact_ids) -> dict:
-    """
-    Pull CONTACT_PROPERTIES for a set of contact IDs in one request per 100.
-
-    Endpoint: POST /crm/v3/objects/contacts/batch/read (max 100 IDs per call).
-
-    Returns {contact_id (str): {property_name: value, ...}}.
-    A contact that was merged or deleted since the list was read just won't be
-    in the result; main() logs and skips those.
-    """
+    """Batch read CONTACT_PROPERTIES, 100 IDs per call. Returns {contact_id: properties}."""
     out = {}
     ids = list(contact_ids)
     for i in range(0, len(ids), 100):
@@ -348,17 +357,7 @@ def get_contacts(contact_ids) -> dict:
 
 
 def get_owners() -> dict:
-    """
-    Map owner IDs to names so the sheet and email say "Lawrence Harrison"
-    instead of "135255920".
-
-    Endpoint: GET /crm/v3/owners/ (paginated).
-    Fetched twice, once for active and once for archived owners, so a contact
-    still owned by someone who left the company resolves to a name instead of
-    "(unassigned)".
-
-    Returns {owner_id (str): "First Last"}.
-    """
+    """Owner ID -> 'First Last', active and archived. GET /crm/v3/owners/."""
     owners = {}
     for archived in ("false", "true"):
         after = None
@@ -377,16 +376,7 @@ def get_owners() -> dict:
 
 
 def get_call_dispositions() -> dict:
-    """
-    Map call outcome IDs to labels.
-
-    HubSpot stores a call's outcome (hs_call_disposition) as a GUID like
-    '9d9162e7-6cf3-4944-bf63-4dff82258764', not the text "Connected". This
-    endpoint (GET /calling/v1/dispositions) returns the lookup table.
-
-    If the token doesn't have access to it, we log a warning and return {} so
-    the sheet shows the raw GUID rather than the whole run failing.
-    """
+    """Call outcome GUID -> label. Falls back to {} if the endpoint isn't available to this token."""
     try:
         data = hs_request("GET", "/calling/v1/dispositions")
         return {d["id"]: d.get("label", d["id"]) for d in data}
@@ -397,22 +387,9 @@ def get_call_dispositions() -> dict:
 
 def get_calls_after(contact_id: str, since: datetime) -> list:
     """
-    All calls associated with one contact that happened at or after `since`,
-    oldest first.
-
-    Endpoint: POST /crm/v3/objects/calls/search
-    Two filters ANDed together inside one filterGroup:
-      - associations.contact EQ <contact_id>   (calls linked to this contact)
-      - hs_timestamp GTE <since in epoch ms>   (on/after the lead time)
-
-    This is the "what counts as a call" rule. Right now: any call, any
-    direction, any outcome. To tighten it (e.g. outbound only), add another
-    filter here such as {"propertyName": "hs_call_direction", "operator": "EQ", "value": "OUTBOUND"}.
-
-    Limit is 50 because we only need the first one; the count is a bonus column.
-
-    Returns a list of dicts, each with "id", "ts" (aware datetime) and the raw
-    call properties merged in.
+    Calls associated with the contact with hs_timestamp >= since, oldest first.
+    POST /crm/v3/objects/calls/search. This is the "what counts as a call" rule:
+    any call, any direction, any outcome. Tighten it by adding filters here.
     """
     since_ms = int(since.timestamp() * 1000)
     body = {
@@ -431,7 +408,7 @@ def get_calls_after(contact_id: str, since: datetime) -> list:
     for r in data.get("results", []):
         p = r.get("properties", {}) or {}
         ts = parse_hs_datetime(p.get("hs_timestamp"))
-        if ts and ts >= since:     # belt and braces; the API filter already did this
+        if ts and ts >= since:
             calls.append({"id": r["id"], "ts": ts, **p})
     calls.sort(key=lambda c: c["ts"])
     return calls
@@ -443,62 +420,53 @@ def get_calls_after(contact_id: str, since: datetime) -> list:
 
 def describe_source(props: dict, added_at: datetime) -> str:
     """
-    Best guess at WHICH form or event put this contact in the list today.
-    Purely informational, it doesn't affect the scoring.
+    Which form/event put this contact in the list. Informational, but also
+    what EXCLUDE_FORMS matches against.
 
-    Order of guesses:
-      1. A HubSpot form submission dated the same day as the list add
-         -> use its name (e.g. "Capital Fund 1 Credit Auth: Credit Auth Form")
-      2. A Heyflow date on the same day -> "Heyflow: LP" / "Heyflow: Main App"
-      3. Whatever created the record (hs_object_source_detail_1)
-      4. Last known form name, or "unknown"
+    HubSpot form names come as "Page title: Form name"; we keep the part after
+    the last ': ' so "Contact Me Website" shows instead of the whole page title.
     """
     added_day = added_at.astimezone(TZ).date()
+
+    # Collect every same-day signal, then prefer one that is NOT on the exclude
+    # list. So a contact who did a Heyflow app AND a credit auth the same day is
+    # scored as a Heyflow lead; only a contact whose sole same-day signal is an
+    # excluded form (credit auth and nothing else) gets excluded.
+    signals = []
     rc = parse_hs_datetime(props.get("recent_conversion_date"))
     if rc and rc.astimezone(TZ).date() == added_day and props.get("recent_conversion_event_name"):
-        return props["recent_conversion_event_name"]
+        signals.append(props["recent_conversion_event_name"].rsplit(": ", 1)[-1])
     hf = parse_hs_datetime(props.get("heyflow_date"))
     if hf and hf.date() == added_day:
-        return f"Heyflow: {props.get('heyflow_form') or 'unknown form'}"
+        signals.append(f"Heyflow: {props.get('heyflow_form') or 'unknown form'}")
+    for s in signals:
+        if not is_excluded(s):
+            return s
+    if signals:
+        return signals[0]          # everything same-day is excluded; return it so evaluate() drops the lead
+
+    # No same-day signal (older contact re-added, Heyflow date not updated, etc.): best-effort label.
     if props.get("hs_object_source_detail_1"):
         return props["hs_object_source_detail_1"]
-    return props.get("recent_conversion_event_name") or "unknown"
+    if props.get("recent_conversion_event_name"):
+        return props["recent_conversion_event_name"].rsplit(": ", 1)[-1]
+    return "unknown"
 
 
-def evaluate(contact_id: str, added_at: datetime, props: dict, owners: dict, dispositions: dict, run_at: datetime) -> dict:
+def evaluate(contact_id: str, added_at: datetime, props: dict, owners: dict, dispositions: dict, run_at: datetime):
     """
-    Score one lead. This is the heart of the job.
-
-    Inputs:
-        contact_id    HubSpot contact ID
-        added_at      when they joined the list (the lead time)
-        props         the contact's properties from get_contacts()
-        owners        owner ID -> name map
-        dispositions  call outcome GUID -> label map
-        run_at        "now", passed in so every row in a run shares one timestamp
-
-    Logic:
-        calls   = calls on this contact after added_at
-        if there is at least one:
-            hours = business hours from added_at to the FIRST call
-            tier  = tier_for(hours)              status = CALLED
-        else:
-            hours = business hours from added_at to now (how overdue)
-            tier  = tier_for(hours), or "After hours" if the clock hasn't started
-            status = NOT CALLED
-
-    Returns one dict whose keys are exactly SHEET_HEADERS. That dict becomes a
-    row in the sheet and a line in the email.
+    Score one lead. Returns a result dict keyed by SHEET_HEADERS (plus private
+    "_" keys the email uses), or None if the source is excluded.
     """
+    source = describe_source(props, added_at)
+    if is_excluded(source):
+        return None
+
     calls = get_calls_after(contact_id, added_at)
     first = calls[0] if calls else None
 
-    # "First Last", falling back to email, falling back to the ID.
     name = f"{props.get('firstname', '') or ''} {props.get('lastname', '') or ''}".strip() or props.get("email", "") or contact_id
     owner_name = owners.get(str(props.get("hubspot_owner_id") or ""), "(unassigned)")
-
-    # Business hours from lead time until right now. For CALLED leads this is
-    # just context; for NOT CALLED leads it's what the tier is based on.
     elapsed = business_hours_between(added_at, run_at)
 
     if first:
@@ -508,17 +476,13 @@ def evaluate(contact_id: str, added_at: datetime, props: dict, owners: dict, dis
         first_call_at = fmt_dt(first["ts"])
         call_owner = owners.get(str(first.get("hubspot_owner_id") or ""), "")
         direction = first.get("hs_call_direction") or ""
-        # Outcome: translate the GUID if we can, else show the GUID, else fall back to call status.
         outcome = dispositions.get(first.get("hs_call_disposition") or "", first.get("hs_call_disposition") or "") or (first.get("hs_call_status") or "")
     else:
         hrs = ""
-        # elapsed == 0 means the lead came in after 5pm (or on a weekend) and
-        # the business-hours clock hasn't started yet, so no flag.
-        tier = tier_for(elapsed) if elapsed > 0 else "After hours (clock not started)"
+        tier = tier_for(elapsed) if elapsed > 0 else TIER_AFTER_HOURS
         status = "NOT CALLED"
         first_call_at = call_owner = direction = outcome = ""
 
-    # HubSpot's native "Lead response time" is stored in milliseconds. Convert to hours.
     hs_rt = props.get("hs_time_to_first_engagement")
     hs_rt_hrs = round(int(hs_rt) / 3_600_000, 1) if hs_rt and str(hs_rt).lstrip("-").isdigit() else ""
 
@@ -532,7 +496,7 @@ def evaluate(contact_id: str, added_at: datetime, props: dict, owners: dict, dis
         "Contact Owner": owner_name,
         "Lead Status": props.get("hs_lead_status") or "",
         "Lead Source": props.get("sales_lead_source_2_0") or "",
-        "Form / Event": describe_source(props, added_at),
+        "Form / Event": source,
         "Recent Conversion Date": fmt_dt(parse_hs_datetime(props.get("recent_conversion_date"))),
         "First Call At": first_call_at,
         "Call Owner": call_owner,
@@ -546,25 +510,20 @@ def evaluate(contact_id: str, added_at: datetime, props: dict, owners: dict, dis
         "HS Lead Response Time (hrs)": hs_rt_hrs,
         "HubSpot Link": hs_link(contact_id),
         "Last Checked": fmt_dt(run_at),
+        # private keys for the email (never written to the sheet)
+        "_added": added_at,
+        "_first_call": first["ts"] if first else None,
     }
 
 
 # --------------------------------------------------------------------------- #
 # Google Sheets
 # --------------------------------------------------------------------------- #
-# The sheet is both the output AND the memory of the job: NOT CALLED rows from
-# earlier days are read back in and re-checked, so a lead that gets called on
-# Wednesday after coming in Monday has its Monday row flipped to CALLED.
-#
-# Row identity = (Contact ID, Lead Added At). Same person submitting again on
-# a different day gets a second row, which is what you want for reporting.
+# The sheet is both the output and the memory: NOT CALLED rows from earlier
+# days are read back in and re-checked. Row identity = (Contact ID, Lead Added At).
 
 def open_sheet():
-    """
-    Authenticate with the service account and return the worksheet object for
-    SHEET_TAB, creating the tab (with headers, frozen) if it doesn't exist.
-    Returns None (and logs a warning) if the Google env vars aren't set.
-    """
+    """Authenticate and return the worksheet, creating the tab with headers if needed. None if not configured."""
     if not GOOGLE_SHEET_ID or not GOOGLE_SERVICE_ACCOUNT_JSON:
         log.warning("Google Sheet not configured (GOOGLE_SHEET_ID / GOOGLE_SERVICE_ACCOUNT_JSON missing). Skipping sheet.")
         return None
@@ -572,9 +531,7 @@ def open_sheet():
     from google.oauth2.service_account import Credentials
 
     info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    creds = Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
+    creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(GOOGLE_SHEET_ID)
     try:
@@ -587,20 +544,9 @@ def open_sheet():
 
 
 def load_sheet_rows(ws):
-    """
-    Read the whole tab once.
-
-    Returns (idx, rows):
-        idx   {header_name: column_index}  e.g. {"Run Date": 0, "Lead Added At": 1, ...}
-        rows  [(sheet_row_number, {header_name: cell_value}), ...]
-              row numbers start at 2 because row 1 is the header
-
-    Reading everything in one call is far cheaper than cell-by-cell reads, and
-    the sheet is small (a few hundred rows a month).
-    """
+    """Read the whole tab once. Returns (idx {header: col}, rows [(row_number, {header: value})])."""
     values = ws.get_all_values()
     if not values:
-        # Brand-new empty tab: write the header so the rest of the code has something to key off.
         ws.append_row(SHEET_HEADERS, value_input_option="USER_ENTERED")
         ws.freeze(rows=1)
         return {h: i for i, h in enumerate(SHEET_HEADERS)}, []
@@ -608,49 +554,56 @@ def load_sheet_rows(ws):
     idx = {h: i for i, h in enumerate(header)}
     rows = []
     for n, raw in enumerate(values[1:], start=2):
-        # Pad short rows: gspread trims trailing empty cells, so raw may be shorter than header.
         d = {h: (raw[i] if i < len(raw) else "") for h, i in idx.items()}
         rows.append((n, d))
     return idx, rows
 
 
-def open_leads_from_sheet(rows, run_at: datetime) -> dict:
+def open_leads_from_sheet(rows, run_at: datetime):
     """
-    From the rows already in the sheet, pick the ones still waiting on a call
-    and young enough to keep chasing (Lead Added At within RECHECK_DAYS).
+    From existing rows, pick the NOT CALLED ones within RECHECK_DAYS to re-check.
+    Rows whose Form / Event now matches EXCLUDE_FORMS are not re-checked; their
+    row numbers come back separately so main() can mark them EXCLUDED.
 
-    Returns {contact_id: added_at} in the same shape as get_list_memberships()
-    so main() can merge the two.
+    Returns ({contact_id: added_at}, [row_numbers_to_exclude]).
     """
     cutoff = run_at - timedelta(days=RECHECK_DAYS)
-    out = {}
-    for _, d in rows:
+    carried, to_exclude = {}, []
+    for n, d in rows:
         if d.get("Status") != "NOT CALLED":
             continue
         added = parse_sheet_dt(d.get("Lead Added At", ""))
         cid = d.get("Contact ID", "").strip()
-        if added and cid and added >= cutoff:
-            out[cid] = added
-    return out
+        if not (added and cid and added >= cutoff):
+            continue
+        if is_excluded(d.get("Form / Event", "")):
+            to_exclude.append(n)
+            continue
+        carried[cid] = added
+    return carried, to_exclude
+
+
+def mark_rows_status(ws, idx, row_numbers, status: str, run_at: datetime):
+    """Set Status (and Last Checked) on specific rows. Used to flip old rows to EXCLUDED."""
+    if not row_numbers:
+        return
+    status_col = _col_letter(idx["Status"] + 1)
+    checked_col = _col_letter(idx["Last Checked"] + 1) if "Last Checked" in idx else None
+    updates = []
+    for n in row_numbers:
+        updates.append({"range": f"{status_col}{n}", "values": [[status]]})
+        if checked_col:
+            updates.append({"range": f"{checked_col}{n}", "values": [[fmt_dt(run_at)]]})
+    ws.batch_update(updates, value_input_option="USER_ENTERED")
+    log.info("Sheet: %d rows marked %s", len(row_numbers), status)
 
 
 def write_results(ws, idx, existing_rows, results: list):
-    """
-    Write result rows to the sheet.
-
-    For each result:
-      - if a row with the same (Contact ID, Lead Added At) already exists,
-        overwrite that row in place (batch_update)
-      - otherwise append it (append_rows)
-
-    Both are done as single bulk API calls, not one call per row, to stay
-    inside Google's quota.
-    """
+    """Update rows that already exist (same Contact ID + Lead Added At) in place, append the rest."""
     key_to_rownum = {}
     for n, d in existing_rows:
         key_to_rownum[(d.get("Contact ID", "").strip(), d.get("Lead Added At", "").strip())] = n
 
-    # Rebuild the header in column order from idx, in case someone reordered columns in the sheet.
     header = [h for h, _ in sorted(idx.items(), key=lambda kv: kv[1])]
     last_col = _col_letter(len(header))
 
@@ -672,7 +625,7 @@ def write_results(ws, idx, existing_rows, results: list):
 
 
 def _col_letter(n: int) -> str:
-    """1 -> 'A', 26 -> 'Z', 27 -> 'AA'. Needed to build A1-style ranges like 'A5:W5'."""
+    """1 -> 'A', 26 -> 'Z', 27 -> 'AA'."""
     s = ""
     while n:
         n, r = divmod(n - 1, 26)
@@ -683,81 +636,189 @@ def _col_letter(n: int) -> str:
 # --------------------------------------------------------------------------- #
 # Email
 # --------------------------------------------------------------------------- #
+# Built from nested tables with inline styles only, because that's what
+# Outlook and Gmail actually render. No <style> block, no flexbox, no CSS grid.
+
+FONT = "font-family:Arial,Helvetica,sans-serif;"
+
 
 def _esc(s) -> str:
-    """Escape &, <, > so a contact named 'Bob <test>' can't break the HTML."""
     return (str(s) if s is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def build_email(results: list, run_at: datetime) -> tuple:
+def _pill(tier: str) -> str:
+    bg, fg, label = TIER_STYLE.get(tier, ("#9E9E9E", "#FFFFFF", tier))
+    return (f"<span style='display:inline-block;padding:3px 9px;border-radius:10px;background:{bg};"
+            f"color:{fg};font-size:11px;font-weight:bold;white-space:nowrap;{FONT}'>{_esc(label)}</span>")
+
+
+def _hrs(v) -> str:
+    try:
+        return f"{float(v):.1f}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _cell(content, align="left", extra="") -> str:
+    return (f"<td align='{align}' style='padding:9px 10px;border-bottom:1px solid {C_LINE};"
+            f"font-size:13px;color:{C_TEXT};vertical-align:top;{FONT}{extra}'>{content}</td>")
+
+
+def _th(label, align="left") -> str:
+    return (f"<th align='{align}' style='padding:6px 10px;font-size:11px;font-weight:bold;color:{C_MUTED};"
+            f"text-transform:uppercase;letter-spacing:.4px;border-bottom:2px solid {C_LINE};{FONT}'>{_esc(label)}</th>")
+
+
+NOWRAP = "white-space:nowrap;"
+
+
+def _name_link(r) -> str:
+    return f"<a href='{r['HubSpot Link']}' style='color:{C_LINK};font-weight:bold;text-decoration:none'>{_esc(r['Name'])}</a>"
+
+
+def _table(header_cells: str, body_rows: str) -> str:
+    return (f"<table width='100%' cellpadding='0' cellspacing='0' border='0' style='border-collapse:collapse'>"
+            f"<tr>{header_cells}</tr>{body_rows}</table>")
+
+
+def _section_title(text: str, count=None, color=C_TEXT) -> str:
+    badge = ""
+    if count is not None:
+        badge = (f" <span style='display:inline-block;margin-left:6px;padding:2px 8px;border-radius:10px;"
+                 f"background:{C_OWNER_BG};color:{C_TEXT};font-size:12px;font-weight:bold'>{count}</span>")
+    return (f"<tr><td style='padding:22px 0 8px;font-size:16px;font-weight:bold;color:{color};{FONT}'>"
+            f"{_esc(text)}{badge}</td></tr>")
+
+
+def _owner_header(owner: str, count: int) -> str:
+    return (f"<tr><td colspan='6' style='padding:10px 10px 6px;background:{C_OWNER_BG};font-size:13px;"
+            f"font-weight:bold;color:{C_TEXT};{FONT}'>{_esc(owner)} "
+            f"<span style='color:{C_MUTED};font-weight:normal'>({count})</span></td></tr>")
+
+
+def _stat_tile(number, label, color=C_TEXT) -> str:
+    return (f"<td width='20%' align='center' style='padding:12px 4px;background:{C_CARD_BG};border:1px solid {C_LINE};"
+            f"border-radius:6px'>"
+            f"<div style='font-size:24px;font-weight:bold;color:{color};{FONT}'>{number}</div>"
+            f"<div style='font-size:11px;color:{C_MUTED};text-transform:uppercase;letter-spacing:.4px;{FONT}'>{_esc(label)}</div>"
+            f"</td>")
+
+
+def build_email(results: list, run_at: datetime, report_day: date) -> tuple:
     """
-    Build the subject line and HTML body.
-
-    Layout:
-        header line with counts
-        "Not called yet"      grouped by Contact Owner, oldest lead first, name links to HubSpot
-        "Called, but late"    anyone CALLED whose tier starts with "Flag", slowest first
-        footer                reminds the reader what the clock rules are
-
-    Returns (subject, html).
+    Returns (subject, html). Two halves:
+      1. Report day: leads whose lead time is after the previous business close.
+         Not called (grouped by owner) -> called late (flat) -> on time (one line).
+      2. Backlog: NOT CALLED leads from before that, flat, oldest first.
     """
-    uncalled = [r for r in results if r["Status"] == "NOT CALLED"]
-    late = [r for r in results if r["Status"] == "CALLED" and r["Tier"].startswith("Flag")]
-    today_str = run_at.strftime("%a %b %d, %Y")
+    cutoff = previous_business_close(report_day)
+    today_rows = [r for r in results if r["_added"] > cutoff]
+    backlog = [r for r in results if r["_added"] <= cutoff and r["Status"] == "NOT CALLED"]
 
-    subject = f"Lead callback check {run_at.strftime('%m/%d')}: {len(uncalled)} uncalled of {len(results)}"
+    t_uncalled = [r for r in today_rows if r["Status"] == "NOT CALLED"]
+    t_late = [r for r in today_rows if r["Status"] == "CALLED" and r["Tier"] != TIER_OK]
+    t_ontime = [r for r in today_rows if r["Status"] == "CALLED" and r["Tier"] == TIER_OK]
 
-    def table(rows, cols):
-        """Render a list of result dicts as a simple HTML table showing only `cols`."""
-        h = "".join(f"<th style='text-align:left;padding:4px 8px;border-bottom:1px solid #ccc'>{_esc(c)}</th>" for c in cols)
-        body = ""
-        for r in rows:
-            cells = ""
-            for c in cols:
-                v = r.get(c, "")
-                if c == "Name":
-                    v = f"<a href='{r['HubSpot Link']}'>{_esc(v)}</a>"
-                else:
-                    v = _esc(v)
-                cells += f"<td style='padding:4px 8px;border-bottom:1px solid #eee'>{v}</td>"
-            body += f"<tr>{cells}</tr>"
-        return f"<table style='border-collapse:collapse;font-size:13px'><tr>{h}</tr>{body}</table>"
+    day_label = report_day.strftime("%a %b %d")          # "Mon Nov 09"
+    day_short = f"{report_day.month}/{report_day.day}"    # "11/9"
+    subject = f"Lead callback {day_short}: {len(t_uncalled)} not called, {len(t_late)} late, {len(backlog)} in backlog"
 
-    html = [f"<div style='font-family:Arial,sans-serif;font-size:14px'>"]
-    html.append(f"<h2 style='margin-bottom:4px'>Lead callback check, {today_str}</h2>")
-    html.append(f"<p>{len(results)} leads checked, <b>{len(uncalled)} not called</b>, {len(late)} called late.</p>")
+    parts = []
 
-    if uncalled:
-        html.append("<h3>Not called yet</h3>")
+    # ---- outer wrapper ----
+    parts.append(f"<body style='margin:0;padding:0;background:{C_PAGE_BG}'>"
+                 f"<table width='100%' cellpadding='0' cellspacing='0' border='0' style='background:{C_PAGE_BG}'>"
+                 f"<tr><td align='center' style='padding:20px 10px'>"
+                 f"<table width='720' cellpadding='0' cellspacing='0' border='0' style='max-width:720px;width:100%'>")
+
+    # ---- header bar ----
+    parts.append(f"<tr><td style='background:{C_HEADER_BG};padding:18px 22px;border-radius:8px 8px 0 0'>"
+                 f"<div style='font-size:20px;font-weight:bold;color:{C_HEADER_TEXT};{FONT}'>Lead Callback Check</div>"
+                 f"<div style='font-size:13px;color:#C9D4E3;margin-top:3px;{FONT}'>Report for {_esc(day_label)}"
+                 f" &nbsp;&middot;&nbsp; sent {_esc(fmt_short(run_at, True))}</div></td></tr>")
+
+    # ---- card ----
+    parts.append(f"<tr><td style='background:{C_CARD_BG};padding:18px 22px 24px;border-radius:0 0 8px 8px'>"
+                 f"<table width='100%' cellpadding='0' cellspacing='0' border='0'>")
+
+    # stat tiles
+    parts.append("<tr><td><table width='100%' cellpadding='0' cellspacing='6' border='0'><tr>"
+                 + _stat_tile(len(today_rows), "Leads in")
+                 + _stat_tile(len(t_ontime), "On time", "#2E7D32")
+                 + _stat_tile(len(t_late), "Called late", "#EF6C00")
+                 + _stat_tile(len(t_uncalled), "Not called", "#C62828")
+                 + _stat_tile(len(backlog), "Backlog", "#6B7280")
+                 + "</tr></table></td></tr>")
+
+    # ---- section 1a: not called, grouped by owner ----
+    parts.append(_section_title(f"{day_label}: not called yet", len(t_uncalled), "#C62828"))
+    if t_uncalled:
         by_owner = {}
-        for r in uncalled:
+        for r in t_uncalled:
             by_owner.setdefault(r["Contact Owner"], []).append(r)
+        body = ""
         for owner in sorted(by_owner):
-            rows = sorted(by_owner[owner], key=lambda r: r["Lead Added At"])
-            html.append(f"<p style='margin:12px 0 4px'><b>{_esc(owner)}</b> ({len(rows)})</p>")
-            html.append(table(rows, ["Name", "Phone", "Lead Added At", "Form / Event", "Biz Hours Elapsed", "Tier"]))
+            body += _owner_header(owner, len(by_owner[owner]))
+            for r in sorted(by_owner[owner], key=lambda r: r["_added"]):
+                body += ("<tr>" + _cell(_name_link(r), extra=NOWRAP) + _cell(_esc(r["Phone"]), extra=NOWRAP)
+                         + _cell(_esc(fmt_short(r["_added"])), extra=NOWRAP) + _cell(_esc(r["Form / Event"]), extra=f"color:{C_MUTED};")
+                         + _cell(_hrs(r["Biz Hours Elapsed"]), "right") + _cell(_pill(r["Tier"]), "center") + "</tr>")
+        parts.append("<tr><td>" + _table(_th("Name") + _th("Phone") + _th("Came in") + _th("Source")
+                                        + _th("Hrs waiting", "right") + _th("Tier", "center"), body) + "</td></tr>")
     else:
-        html.append("<p>Everyone got a call. Nice.</p>")
+        parts.append(f"<tr><td style='padding:6px 10px;font-size:13px;color:{C_MUTED};{FONT}'>Everyone got a call. Nice.</td></tr>")
 
-    if late:
-        html.append("<h3 style='margin-top:24px'>Called, but late</h3>")
-        html.append(table(sorted(late, key=lambda r: -float(r["Biz Hours To First Call"] or 0)),
-                          ["Name", "Contact Owner", "Lead Added At", "First Call At", "Biz Hours To First Call", "Tier"]))
+    # ---- section 1b: called late ----
+    parts.append(_section_title(f"{day_label}: called, but late", len(t_late), "#EF6C00"))
+    if t_late:
+        body = ""
+        for r in sorted(t_late, key=lambda r: -float(r["Biz Hours To First Call"] or 0)):
+            body += ("<tr>" + _cell(_name_link(r), extra=NOWRAP) + _cell(_esc(r["Contact Owner"]), extra=NOWRAP)
+                     + _cell(_esc(fmt_short(r["_added"])), extra=NOWRAP) + _cell(_esc(fmt_short(r["_first_call"])), extra=NOWRAP)
+                     + _cell(_hrs(r["Biz Hours To First Call"]), "right") + _cell(_pill(r["Tier"]), "center") + "</tr>")
+        parts.append("<tr><td>" + _table(_th("Name") + _th("Owner") + _th("Came in") + _th("First call")
+                                        + _th("Hrs to call", "right") + _th("Tier", "center"), body) + "</td></tr>")
+    else:
+        parts.append(f"<tr><td style='padding:6px 10px;font-size:13px;color:{C_MUTED};{FONT}'>None.</td></tr>")
 
-    html.append("<p style='color:#777;font-size:12px;margin-top:24px'>Lead time = time added to the HubSpot list. "
-                "Business hours Mon-Fri "
-                f"{BUSINESS_START}:00-{BUSINESS_END}:00 {TZ.key}. Full log in the Google Sheet.</p></div>")
-    return subject, "".join(html)
+    # ---- section 1c: on time, one line ----
+    if t_ontime:
+        by_owner = {}
+        for r in t_ontime:
+            by_owner[r["Contact Owner"]] = by_owner.get(r["Contact Owner"], 0) + 1
+        line = ", ".join(f"{_esc(o)} ({n})" for o, n in sorted(by_owner.items()))
+        parts.append(f"<tr><td style='padding:14px 10px 0;font-size:13px;color:{C_TEXT};{FONT}'>"
+                     f"<span style='color:#2E7D32;font-weight:bold'>Called within the hour:</span> {line}</td></tr>")
+
+    # ---- section 2: backlog ----
+    parts.append(f"<tr><td style='padding-top:22px'><hr style='border:0;border-top:1px solid {C_LINE};margin:0'></td></tr>")
+    parts.append(_section_title(f"Still not called from before {day_short}", len(backlog), C_TEXT))
+    if backlog:
+        body = ""
+        for r in sorted(backlog, key=lambda r: r["_added"]):
+            body += ("<tr>" + _cell(_name_link(r), extra=NOWRAP) + _cell(_esc(r["Contact Owner"]), extra=NOWRAP) + _cell(_esc(r["Phone"]), extra=NOWRAP)
+                     + _cell(_esc(fmt_short(r["_added"], True)), extra=NOWRAP) + _cell(_esc(r["Form / Event"]), extra=f"color:{C_MUTED};")
+                     + _cell(_hrs(r["Biz Hours Elapsed"]), "right") + "</tr>")
+        parts.append("<tr><td>" + _table(_th("Name") + _th("Owner") + _th("Phone") + _th("Came in") + _th("Source")
+                                        + _th("Hrs waiting", "right"), body) + "</td></tr>")
+    else:
+        parts.append(f"<tr><td style='padding:6px 10px;font-size:13px;color:{C_MUTED};{FONT}'>Backlog is clear.</td></tr>")
+
+    # ---- footer ----
+    sheet_link = f" &nbsp;&middot;&nbsp; <a href='{SHEET_URL}' style='color:{C_LINK}'>Open the sheet</a>" if SHEET_URL else ""
+    excl = f" Excluded: {_esc(', '.join(EXCLUDE_FORMS))}." if EXCLUDE_FORMS else ""
+    parts.append(f"<tr><td style='padding-top:22px;font-size:11px;color:{C_MUTED};line-height:1.5;{FONT}'>"
+                 f"Lead time is the moment the contact joined the HubSpot list. A call is any call logged on the contact after that. "
+                 f"Hours count Mon-Fri {BUSINESS_START}:00-{BUSINESS_END}:00 {_esc(TZ.key)} only; weekend and after-hours leads "
+                 f"start their clock at the next open. Tiers: On time &lt;1h, Flag 1 1-3h, Flag 2 3h+, Flag 3 1+ business day.{excl}"
+                 f"{sheet_link}</td></tr>")
+
+    parts.append("</table></td></tr></table></td></tr></table></body>")
+    return subject, "".join(parts)
 
 
 def send_email(subject: str, html: str):
-    """
-    Send via Gmail SMTP (smtp.gmail.com:587 with STARTTLS).
-
-    Needs a Google App Password, not the account password. The message is
-    multipart/alternative with a plain-text stub plus the HTML, which is the
-    polite way to send HTML mail. Skips with a warning if Gmail isn't configured.
-    """
+    """Send via Gmail SMTP (smtp.gmail.com:587, STARTTLS, App Password)."""
     if not GMAIL_USER or not GMAIL_APP_PASSWORD:
         log.warning("Gmail not configured (GMAIL_USER / GMAIL_APP_PASSWORD missing). Skipping email.")
         return
@@ -780,64 +841,66 @@ def send_email(subject: str, html: str):
 # --------------------------------------------------------------------------- #
 
 def main():
-    """
-    Orchestrates the whole run. Read this top to bottom and it mirrors the
-    numbered flow in the file header.
-
-    DRY_RUN=true short-circuits before any writes: no sheet (and therefore no
-    carry-forward, since the sheet is the memory), no email. It prints a
-    tab-separated table to stdout instead, which is what you'll see in the
-    Actions log.
-    """
     if not HUBSPOT_TOKEN:
         log.error("HUBSPOT_TOKEN is not set")
         sys.exit(1)
 
     run_at = now_tz()
-    log.info("Run at %s (DRY_RUN=%s)", fmt_dt(run_at), DRY_RUN)
+    report_day = report_day_for(run_at)
+    window_start = previous_business_close(report_day)
+    log.info("Run at %s, report day %s, window opens %s (DRY_RUN=%s)",
+             fmt_dt(run_at), report_day, fmt_dt(window_start), DRY_RUN)
 
-    # 1. Today's list members with the time they joined the list
+    # 1. List members with the time they joined
     members = get_list_memberships(LIST_ID)
     log.info("List %s has %d members", LIST_ID, len(members))
+    if REPORT_DAY_ONLY:
+        # The list's "less than 1 day ago" filter really means yesterday + today, so trim it
+        # to the report-day window. Older uncalled leads come back via the sheet carry-forward.
+        members = {cid: added for cid, added in members.items() if added > window_start}
+        log.info("%d of those fall in the report-day window", len(members))
 
-    # 2. Leads from earlier runs still waiting on a call (needs the sheet)
+    # 2. Leads from earlier runs still waiting on a call
     ws = None if DRY_RUN else open_sheet()
     idx, existing_rows = (None, [])
-    carried = {}
+    carried, to_exclude = {}, []
     if ws:
         idx, existing_rows = load_sheet_rows(ws)
-        carried = open_leads_from_sheet(existing_rows, run_at)
+        carried, to_exclude = open_leads_from_sheet(existing_rows, run_at)
         for cid in list(carried):
-            if cid in members:          # they re-submitted today; today's list entry wins
+            if cid in members:          # re-submitted today; today's entry wins
                 carried.pop(cid)
-        log.info("Carrying forward %d uncalled leads from earlier runs", len(carried))
+        log.info("Carrying forward %d uncalled leads, %d old rows to mark EXCLUDED", len(carried), len(to_exclude))
+        mark_rows_status(ws, idx, to_exclude, "EXCLUDED", run_at)
 
-    # Merge. If a contact is in both, the later (today's) value from `members` wins.
     targets = {**carried, **members}
     if not targets:
-        log.info("Nothing to check today.")
+        log.info("Nothing to check.")
         if not DRY_RUN:
-            send_email(f"Lead callback check {run_at.strftime('%m/%d')}: no leads today",
-                       "<p>The list was empty at run time. Nothing to check.</p>")
+            send_email(f"Lead callback {report_day.month}/{report_day.day}: no leads",
+                       "<p>The list was empty at run time and the backlog is clear.</p>")
         return
 
-    # 3. Context lookups, done once per run rather than once per lead
+    # 3. Context lookups
     owners = get_owners()
     dispositions = get_call_dispositions()
     contacts = get_contacts(targets.keys())
 
-    # 4. Evaluate each lead, oldest lead time first
-    results = []
+    # 4. Evaluate
+    results, excluded = [], 0
     for cid, added_at in sorted(targets.items(), key=lambda kv: kv[1]):
         props = contacts.get(cid)
         if props is None:
             log.warning("Contact %s not found (merged or deleted?), skipping", cid)
             continue
-        results.append(evaluate(cid, added_at, props, owners, dispositions, run_at))
-        time.sleep(0.25)   # one search call per lead; this keeps us well under HubSpot's 4/sec search limit
-
-    uncalled = sum(1 for r in results if r["Status"] == "NOT CALLED")
-    log.info("%d leads evaluated, %d not called", len(results), uncalled)
+        r = evaluate(cid, added_at, props, owners, dispositions, run_at)
+        if r is None:
+            excluded += 1
+            continue
+        results.append(r)
+        time.sleep(0.25)
+    log.info("%d leads evaluated, %d excluded by EXCLUDE_FORMS, %d not called",
+             len(results), excluded, sum(1 for r in results if r["Status"] == "NOT CALLED"))
 
     # 5. Output
     if DRY_RUN:
@@ -846,18 +909,21 @@ def main():
         print("\t".join(cols))
         for r in results:
             print("\t".join(str(r.get(c, "")) for c in cols))
-        subject, _ = build_email(results, run_at)
+        subject, html = build_email(results, run_at, report_day)
         print(f"\n[DRY RUN] Would email: {subject}")
+        out = os.environ.get("DRY_RUN_HTML")      # optional: save the email to a file to eyeball it
+        if out:
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(html)
+            print(f"[DRY RUN] Email HTML written to {out}")
         return
 
     if ws:
         write_results(ws, idx, existing_rows, results)
 
-    subject, html = build_email(results, run_at)
+    subject, html = build_email(results, run_at, report_day)
     send_email(subject, html)
 
 
-# Standard Python idiom: only run main() when the file is executed directly
-# (python lead_callback_check.py), not when it's imported by a test.
 if __name__ == "__main__":
     main()
