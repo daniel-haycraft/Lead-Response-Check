@@ -763,7 +763,7 @@ def build_email(results: list, run_at: datetime, report_day: date) -> tuple:
                 body += ("<tr>" + _cell(_name_link(r), extra=NOWRAP) + _cell(_esc(r["Phone"]), extra=NOWRAP)
                          + _cell(_esc(fmt_short(r["_added"])), extra=NOWRAP) + _cell(_esc(r["Form / Event"]), extra=f"color:{C_MUTED};")
                          + _cell(_hrs(r["Biz Hours Elapsed"]), "right") + _cell(_pill(r["Tier"]), "center") + "</tr>")
-        parts.append("<tr><td>" + _table(_th("Name") + _th("Phone") + _th("Came in") + _th("Source")
+        parts.append("<tr><td>" + _table(_th("Name") + _th("Phone") + _th("Came in") + _th("Latest recorded source")
                                         + _th("Hrs waiting", "right") + _th("Tier", "center"), body) + "</td></tr>")
     else:
         parts.append(f"<tr><td style='padding:6px 10px;font-size:13px;color:{C_MUTED};{FONT}'>Everyone got a call. Nice.</td></tr>")
@@ -799,7 +799,7 @@ def build_email(results: list, run_at: datetime, report_day: date) -> tuple:
             body += ("<tr>" + _cell(_name_link(r), extra=NOWRAP) + _cell(_esc(r["Contact Owner"]), extra=NOWRAP) + _cell(_esc(r["Phone"]), extra=NOWRAP)
                      + _cell(_esc(fmt_short(r["_added"], True)), extra=NOWRAP) + _cell(_esc(r["Form / Event"]), extra=f"color:{C_MUTED};")
                      + _cell(_hrs(r["Biz Hours Elapsed"]), "right") + "</tr>")
-        parts.append("<tr><td>" + _table(_th("Name") + _th("Owner") + _th("Phone") + _th("Came in") + _th("Source")
+        parts.append("<tr><td>" + _table(_th("Name") + _th("Owner") + _th("Phone") + _th("Came in") + _th("Latest recorded source")
                                         + _th("Hrs waiting", "right"), body) + "</td></tr>")
     else:
         parts.append(f"<tr><td style='padding:6px 10px;font-size:13px;color:{C_MUTED};{FONT}'>Backlog is clear.</td></tr>")
