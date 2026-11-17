@@ -691,7 +691,7 @@ def _section_title(text: str, count=None, color=C_TEXT) -> str:
 
 
 def _owner_header(owner: str, count: int) -> str:
-    return (f"<tr><td colspan='6' style='padding:10px 10px 6px;background:{C_OWNER_BG};font-size:13px;"
+    return (f"<tr><td colspan='5' style='padding:10px 10px 6px;background:{C_OWNER_BG};font-size:13px;"
             f"font-weight:bold;color:{C_TEXT};{FONT}'>{_esc(owner)} "
             f"<span style='color:{C_MUTED};font-weight:normal'>({count})</span></td></tr>")
 
@@ -761,9 +761,9 @@ def build_email(results: list, run_at: datetime, report_day: date) -> tuple:
             body += _owner_header(owner, len(by_owner[owner]))
             for r in sorted(by_owner[owner], key=lambda r: r["_added"]):
                 body += ("<tr>" + _cell(_name_link(r), extra=NOWRAP) + _cell(_esc(r["Phone"]), extra=NOWRAP)
-                         + _cell(_esc(fmt_short(r["_added"])), extra=NOWRAP) + _cell(_esc(r["Form / Event"]), extra=f"color:{C_MUTED};")
+                         + _cell(_esc(fmt_short(r["_added"])), extra=NOWRAP)
                          + _cell(_hrs(r["Biz Hours Elapsed"]), "right") + _cell(_pill(r["Tier"]), "center") + "</tr>")
-        parts.append("<tr><td>" + _table(_th("Name") + _th("Phone") + _th("Came in") + _th("Latest recorded source")
+        parts.append("<tr><td>" + _table(_th("Name") + _th("Phone") + _th("Came in")
                                         + _th("Hrs waiting", "right") + _th("Tier", "center"), body) + "</td></tr>")
     else:
         parts.append(f"<tr><td style='padding:6px 10px;font-size:13px;color:{C_MUTED};{FONT}'>Everyone got a call. Nice.</td></tr>")
@@ -797,9 +797,9 @@ def build_email(results: list, run_at: datetime, report_day: date) -> tuple:
         body = ""
         for r in sorted(backlog, key=lambda r: r["_added"]):
             body += ("<tr>" + _cell(_name_link(r), extra=NOWRAP) + _cell(_esc(r["Contact Owner"]), extra=NOWRAP) + _cell(_esc(r["Phone"]), extra=NOWRAP)
-                     + _cell(_esc(fmt_short(r["_added"], True)), extra=NOWRAP) + _cell(_esc(r["Form / Event"]), extra=f"color:{C_MUTED};")
+                     + _cell(_esc(fmt_short(r["_added"], True)), extra=NOWRAP)
                      + _cell(_hrs(r["Biz Hours Elapsed"]), "right") + "</tr>")
-        parts.append("<tr><td>" + _table(_th("Name") + _th("Owner") + _th("Phone") + _th("Came in") + _th("Latest recorded source")
+        parts.append("<tr><td>" + _table(_th("Name") + _th("Owner") + _th("Phone") + _th("Came in")
                                         + _th("Hrs waiting", "right"), body) + "</td></tr>")
     else:
         parts.append(f"<tr><td style='padding:6px 10px;font-size:13px;color:{C_MUTED};{FONT}'>Backlog is clear.</td></tr>")
