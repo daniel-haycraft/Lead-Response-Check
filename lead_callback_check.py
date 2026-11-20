@@ -128,6 +128,7 @@ LOOKBACK_MINUTES = int(os.environ.get("LOOKBACK_MINUTES", "60"))   # a call or e
 COUNT_EMAILS = os.environ.get("COUNT_EMAILS", "true").strip().lower() in ("1", "true", "yes")   # one-to-one rep emails count as outreach
 REPORT_DAY_ONLY = os.environ.get("REPORT_DAY_ONLY", "true").strip().lower() in ("1", "true", "yes")
 EXCLUDE_FORMS = [s.strip().lower() for s in os.environ.get("EXCLUDE_FORMS", "Credit Auth").split(",") if s.strip()]
+EXCLUDE_LEAD_STATUSES = [s.strip().lower() for s in os.environ.get("EXCLUDE_LEAD_STATUSES", "UNQUALIFIED,DO NOT CONTACT").split(",") if s.strip()]
 DRY_RUN = os.environ.get("DRY_RUN", "false").strip().lower() in ("1", "true", "yes")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -599,6 +600,10 @@ def evaluate(contact_id: str, added_at: datetime, props: dict, owners: dict, dis
         status = STATUS_OPEN
         outreach_at = outreach_by = ""
 
+            # Unqualified / Do Not Contact leads that nobody reached out to are dropped, not flagged.
+    if status == STATUS_OPEN and (props.get("hs_lead_status") or "").strip().lower() in EXCLUDE_LEAD_STATUSES:
+        return None
+
     hs_rt = props.get("hs_time_to_first_engagement")
     hs_rt_hrs = round(int(hs_rt) / 3_600_000, 1) if hs_rt and str(hs_rt).lstrip("-").isdigit() else ""
 
@@ -1037,6 +1042,7 @@ def main():
 
     # 4. Evaluate
     results, excluded = [], 0
+    dropped = set()
     for cid, added_at in sorted(targets.items(), key=lambda kv: kv[1]):
         props = contacts.get(cid)
         if props is None:
@@ -1045,6 +1051,7 @@ def main():
         r = evaluate(cid, added_at, props, owners, dispositions, run_at)
         if r is None:
             excluded += 1
+            dropped.add((cid, fmt_dt(added_at)))
             continue
         results.append(r)
         time.sleep(0.25)
@@ -1054,6 +1061,11 @@ def main():
              sum(1 for r in results if r["Status"] == STATUS_EMAILED),
              sum(1 for r in results if r["Status"] == STATUS_OPEN))
 
+    if ws and dropped:
+        stale = [n for n, d in existing_rows
+                 if d.get("Status") == STATUS_OPEN
+                 and (d.get("Contact ID", "").strip(), d.get("Lead Added At", "").strip()) in dropped]
+        mark_rows_status(ws, idx, stale, "EXCLUDED", run_at)
     # 5. Output
     if DRY_RUN:
         cols = ["Name", "Contact Owner", "Lead Added At", "First Outreach", "First Outreach At",
