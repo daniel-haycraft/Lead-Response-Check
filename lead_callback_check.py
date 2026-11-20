@@ -356,7 +356,7 @@ def hs_request(method: str, path: str, **kwargs):
 def get_list_memberships(list_id: str) -> dict:
     """
     Everyone in the list with the moment they were added (the lead time).
-    GET /crm/v3/lists/{listId}/memberships/join-order, paginated.
+    paginated.
     Returns {contact_id (str): added_at (aware datetime)}.
     """
     members = {}
@@ -365,7 +365,7 @@ def get_list_memberships(list_id: str) -> dict:
         params = {"limit": 250}
         if after:
             params["after"] = after
-        data = hs_request("GET", f"/crm/v3/lists/{list_id}/memberships/join-order", params=params)
+        data = hs_request("GET", f"/crm/lists/2026-09/{list_id}/memberships/join-order", params=params)
         for m in data.get("results", []):
             added = parse_hs_datetime(m.get("membershipTimestamp"))
             if added:
@@ -383,14 +383,14 @@ def get_contacts(contact_ids) -> dict:
     for i in range(0, len(ids), 100):
         chunk = ids[i:i + 100]
         body = {"properties": CONTACT_PROPERTIES, "inputs": [{"id": cid} for cid in chunk]}
-        data = hs_request("POST", "/crm/v3/objects/contacts/batch/read", data=json.dumps(body))
+        data = hs_request("POST", "/crm/objects/2026-03/contacts/batch/read", data=json.dumps(body))
         for r in data.get("results", []):
             out[str(r["id"])] = r.get("properties", {}) or {}
     return out
 
 
 def get_owners() -> dict:
-    """Owner ID -> 'First Last', active and archived. GET /crm/v3/owners/."""
+    """Owner ID -> 'First Last', active and archived. """
     owners = {}
     for archived in ("false", "true"):
         after = None
@@ -398,7 +398,7 @@ def get_owners() -> dict:
             params = {"limit": 500, "archived": archived}
             if after:
                 params["after"] = after
-            data = hs_request("GET", "/crm/v3/owners/", params=params)
+            data = hs_request("GET", "/crm/owners/2026-03", params=params)
             for o in data.get("results", []):
                 name = f"{o.get('firstName', '') or ''} {o.get('lastName', '') or ''}".strip() or o.get("email", "") or str(o["id"])
                 owners[str(o["id"])] = name
@@ -421,7 +421,7 @@ def get_call_dispositions() -> dict:
 def get_calls_after(contact_id: str, since: datetime) -> list:
     """
     Calls associated with the contact from LOOKBACK_MINUTES before `since` onward,
-    oldest first. POST /crm/v3/objects/calls/search. This is the "what counts as
+    oldest first. This is the "what counts as
     a call" rule: any call, any direction, any outcome. Tighten it by adding
     filters here.
     """
@@ -438,7 +438,7 @@ def get_calls_after(contact_id: str, since: datetime) -> list:
         "properties": CALL_PROPERTIES,
         "limit": 50,
     }
-    data = hs_request("POST", "/crm/v3/objects/calls/search", data=json.dumps(body))
+    data = hs_request("POST", "/crm/objects/2026-03/calls/search", data=json.dumps(body))
     calls = []
     for r in data.get("results", []):
         p = r.get("properties", {}) or {}
@@ -455,7 +455,7 @@ _EMAILS_AVAILABLE = True   # flipped off for the rest of the run if the token ca
 def get_emails_after(contact_id: str, since: datetime) -> list:
     """
     One-to-one emails a CF1 user SENT to the contact from LOOKBACK_MINUTES before
-    `since` onward, oldest first. POST /crm/v3/objects/emails/search.
+    `since` onward, oldest first. 
 
     What counts:
       - hs_email_direction = EMAIL        outgoing one-to-one (not INCOMING_EMAIL, not marketing sends,
@@ -486,7 +486,7 @@ def get_emails_after(contact_id: str, since: datetime) -> list:
         "limit": 50,
     }
     try:
-        data = hs_request("POST", "/crm/v3/objects/emails/search", data=json.dumps(body))
+        data = hs_request("POST", "/crm/objects/2026-03/emails/search", data=json.dumps(body))
     except RuntimeError as exc:
         if "-> 403" in str(exc):
             _EMAILS_AVAILABLE = False
