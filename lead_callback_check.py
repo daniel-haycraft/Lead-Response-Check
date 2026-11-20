@@ -7,25 +7,32 @@
 WHAT THIS DOES
 --------------
 Runs once at the end of each business day and answers one question for every
-lead that came in: "did a loan officer call this person, and how fast?"
+lead that came in: "did a loan officer reach out to this person, and how fast?"
+
+"Reach out" means a call logged on the contact, or a one-to-one email a CF1
+user sent them. Sequence emails and marketing emails do not count.
 
 The flow, top to bottom:
 
     1. HubSpot list  ->  who submitted a form, and WHEN they were added to the
                          list. That add time is the "lead time".
     2. Google Sheet  ->  any leads from previous days that are still marked
-                         NOT CALLED get pulled back in and re-checked.
-    3. HubSpot       ->  for each lead, pull the calls logged on the contact
-                         that happened AFTER the lead time.
-    4. Math          ->  business hours between lead time and the first call,
+                         NOT CALLED (no call, no email) get pulled back in and
+                         re-checked.
+    3. HubSpot       ->  for each lead, pull the calls and one-to-one emails on
+                         the contact from LOOKBACK_MINUTES (default 60) before
+                         the lead time onward. The lookback covers a rep who was
+                         already on the phone when the form came in.
+    4. Math          ->  first outreach = whichever came first, call or email.
+                         Business hours from lead time to that first outreach,
                          bucketed into a tier (OK / Flag 1 / Flag 2 / Flag 3).
-                         No call at all = NOT CALLED.
+                         Status: CALLED, EMAILED (email only), or NOT CALLED.
     5. Google Sheet  ->  one row per lead. Existing rows (same contact + same
                          lead time) are updated in place, new ones appended.
     6. Email         ->  styled HTML report in two parts:
-                           - the report day's leads (grouped by owner: not called,
-                             then called late, then a one-liner for on-time)
-                           - the backlog: anyone from earlier days still uncalled
+                           - the report day's leads (grouped by owner: no outreach,
+                             then late first outreach, then a one-liner for on-time)
+                           - the backlog: anyone from earlier days with no outreach
 
 REPORT DAY
 ----------
@@ -60,6 +67,10 @@ ENVIRONMENT VARIABLES
     RECHECK_DAYS       default 7             DRY_RUN            default false
     EXCLUDE_FORMS      default "Credit Auth" (comma-separated, case-insensitive
                        substring match on the Form / Event column)
+    LOOKBACK_MINUTES   default 60 (a call or email this many minutes BEFORE the
+                       lead time still counts)
+    COUNT_EMAILS       default true (set false to go back to calls only). Needs
+                       the sales-email-read scope on the HubSpot private app.
     REPORT_DAY_ONLY    default true (only score list members whose lead time
                        falls in the report day window; older ones come back
                        through the sheet carry-forward instead)
@@ -113,6 +124,8 @@ DAY_HOURS = BUSINESS_END - BUSINESS_START                     # 9 hours = "one f
 
 # --- Behaviour ---
 RECHECK_DAYS = int(os.environ.get("RECHECK_DAYS", "7"))
+LOOKBACK_MINUTES = int(os.environ.get("LOOKBACK_MINUTES", "60"))   # a call or email this many minutes BEFORE the lead time still counts
+COUNT_EMAILS = os.environ.get("COUNT_EMAILS", "true").strip().lower() in ("1", "true", "yes")   # one-to-one rep emails count as outreach
 REPORT_DAY_ONLY = os.environ.get("REPORT_DAY_ONLY", "true").strip().lower() in ("1", "true", "yes")
 EXCLUDE_FORMS = [s.strip().lower() for s in os.environ.get("EXCLUDE_FORMS", "Credit Auth").split(",") if s.strip()]
 DRY_RUN = os.environ.get("DRY_RUN", "false").strip().lower() in ("1", "true", "yes")
@@ -137,6 +150,12 @@ CALL_PROPERTIES = [
     "hs_call_title", "hs_call_duration", "hubspot_owner_id", "hs_createdate",
 ]
 
+# Email engagement properties. hs_sequence_id is only filled on emails a sequence sent.
+EMAIL_PROPERTIES = [
+    "hs_timestamp", "hs_email_direction", "hs_email_status", "hs_sequence_id",
+    "hubspot_owner_id", "hs_email_from_email", "hs_email_subject",
+]
+
 # Column order in the Google Sheet. evaluate()'s result dict uses these exact keys
 # (plus a few private "_" keys for the email that never get written to the sheet).
 SHEET_HEADERS = [
@@ -145,7 +164,19 @@ SHEET_HEADERS = [
     "First Call At", "Call Owner", "Call Direction", "Call Outcome", "Calls After Lead",
     "Biz Hours To First Call", "Biz Hours Elapsed", "Tier", "Status",
     "HS Lead Response Time (hrs)", "HubSpot Link", "Last Checked",
+    # added with email support; appended to the right of an existing sheet automatically
+    "First Outreach", "First Outreach At", "First Outreach By",
+    "Biz Hours To First Outreach", "First Email At", "Emails After Lead",
 ]
+
+# Status values written to the sheet:
+#   CALLED      a call was logged in the window (there may also be an email)
+#   EMAILED     no call, but the rep sent a one-to-one email
+#   NOT CALLED  no call and no email. These are the rows that get re-checked each run.
+#   EXCLUDED    dropped by EXCLUDE_FORMS
+STATUS_CALLED = "CALLED"
+STATUS_EMAILED = "EMAILED"
+STATUS_OPEN = "NOT CALLED"
 
 DT_FMT = "%Y-%m-%d %H:%M:%S"
 
@@ -164,16 +195,17 @@ TIER_STYLE = {   # background, text colour, short label for the pill
     TIER_AFTER_HOURS: ("#90A4AE", "#FFFFFF", "After hrs"),
 }
 
-# Email palette. Swap these for CF1 brand colours if you want.
-C_HEADER_BG = "#1F3A5F"
+# Email palette, matched to CF1's marketing email template.
+C_HEADER_BG = "#234058"      # CF1 navy header bar
 C_HEADER_TEXT = "#FFFFFF"
-C_PAGE_BG = "#F2F4F7"
+C_PAGE_BG = "#EAF0F6"        # light blue-grey page background
 C_CARD_BG = "#FFFFFF"
 C_TEXT = "#1B1B1B"
 C_MUTED = "#6B7280"
-C_LINE = "#E5E7EB"
-C_OWNER_BG = "#EEF2F7"
-C_LINK = "#1F3A5F"
+C_LINE = "#E1E7EE"
+C_OWNER_BG = "#EAF0F6"       # owner group rows pick up the page tint
+C_LINK = "#00A4BD"           # CF1 link teal
+C_BRAND_NAME = "Capital Fund 1"
 
 
 # --------------------------------------------------------------------------- #
@@ -387,10 +419,12 @@ def get_call_dispositions() -> dict:
 
 def get_calls_after(contact_id: str, since: datetime) -> list:
     """
-    Calls associated with the contact with hs_timestamp >= since, oldest first.
-    POST /crm/v3/objects/calls/search. This is the "what counts as a call" rule:
-    any call, any direction, any outcome. Tighten it by adding filters here.
+    Calls associated with the contact from LOOKBACK_MINUTES before `since` onward,
+    oldest first. POST /crm/v3/objects/calls/search. This is the "what counts as
+    a call" rule: any call, any direction, any outcome. Tighten it by adding
+    filters here.
     """
+    since = since - timedelta(minutes=LOOKBACK_MINUTES)
     since_ms = int(since.timestamp() * 1000)
     body = {
         "filterGroups": [{
@@ -412,6 +446,68 @@ def get_calls_after(contact_id: str, since: datetime) -> list:
             calls.append({"id": r["id"], "ts": ts, **p})
     calls.sort(key=lambda c: c["ts"])
     return calls
+
+
+_EMAILS_AVAILABLE = True   # flipped off for the rest of the run if the token can't read emails
+
+
+def get_emails_after(contact_id: str, since: datetime) -> list:
+    """
+    One-to-one emails a CF1 user SENT to the contact from LOOKBACK_MINUTES before
+    `since` onward, oldest first. POST /crm/v3/objects/emails/search.
+
+    What counts:
+      - hs_email_direction = EMAIL        outgoing one-to-one (not INCOMING_EMAIL, not marketing sends,
+                                          which are never logged as email engagements at all)
+      - no hs_sequence_id                 sequence steps are automated, so they don't count
+      - status not BOUNCED / FAILED       it has to have actually gone out
+
+    Needs the `sales-email-read` scope on the private app. If the token doesn't
+    have it HubSpot answers 403; we log that once and carry on call-only instead
+    of killing the nightly report.
+    """
+    global _EMAILS_AVAILABLE
+    if not COUNT_EMAILS or not _EMAILS_AVAILABLE:
+        return []
+    since = since - timedelta(minutes=LOOKBACK_MINUTES)
+    since_ms = int(since.timestamp() * 1000)
+    body = {
+        "filterGroups": [{
+            "filters": [
+                {"propertyName": "associations.contact", "operator": "EQ", "value": str(contact_id)},
+                {"propertyName": "hs_timestamp", "operator": "GTE", "value": str(since_ms)},
+                {"propertyName": "hs_email_direction", "operator": "EQ", "value": "EMAIL"},
+                {"propertyName": "hs_sequence_id", "operator": "NOT_HAS_PROPERTY"},
+            ]
+        }],
+        "sorts": [{"propertyName": "hs_timestamp", "direction": "ASCENDING"}],
+        "properties": EMAIL_PROPERTIES,
+        "limit": 50,
+    }
+    try:
+        data = hs_request("POST", "/crm/v3/objects/emails/search", data=json.dumps(body))
+    except RuntimeError as exc:
+        if "-> 403" in str(exc):
+            _EMAILS_AVAILABLE = False
+            log.warning("Token can't read emails (add the sales-email-read scope to the private app). "
+                        "Continuing with calls only. HubSpot said: %s", str(exc)[:300])
+            return []
+        raise
+    emails = []
+    for r in data.get("results", []):
+        p = r.get("properties", {}) or {}
+        ts = parse_hs_datetime(p.get("hs_timestamp"))
+        if not ts or ts < since:
+            continue
+        if p.get("hs_sequence_id"):                                   # belt and braces
+            continue
+        if (p.get("hs_email_direction") or "") != "EMAIL":
+            continue
+        if (p.get("hs_email_status") or "").upper() in ("BOUNCED", "FAILED"):
+            continue
+        emails.append({"id": r["id"], "ts": ts, **p})
+    emails.sort(key=lambda e: e["ts"])
+    return emails
 
 
 # --------------------------------------------------------------------------- #
@@ -463,25 +559,45 @@ def evaluate(contact_id: str, added_at: datetime, props: dict, owners: dict, dis
         return None
 
     calls = get_calls_after(contact_id, added_at)
-    first = calls[0] if calls else None
+    if COUNT_EMAILS and _EMAILS_AVAILABLE:
+        time.sleep(0.2)                       # two searches per lead now; stay under HubSpot's search rate limit
+    emails = get_emails_after(contact_id, added_at)
+    first_call = calls[0] if calls else None
+    first_email = emails[0] if emails else None
+
+    # First outreach = whichever came first, the first call or the first one-to-one email.
+    # (A tie goes to the call because it is listed first.)
+    touches = [(kind, t) for kind, t in (("Call", first_call), ("Email", first_email)) if t]
+    outreach_kind, first = min(touches, key=lambda kt: kt[1]["ts"]) if touches else ("", None)
 
     name = f"{props.get('firstname', '') or ''} {props.get('lastname', '') or ''}".strip() or props.get("email", "") or contact_id
     owner_name = owners.get(str(props.get("hubspot_owner_id") or ""), "(unassigned)")
     elapsed = business_hours_between(added_at, run_at)
 
-    if first:
-        hrs = business_hours_between(added_at, first["ts"])
-        tier = tier_for(hrs)
-        status = "CALLED"
-        first_call_at = fmt_dt(first["ts"])
-        call_owner = owners.get(str(first.get("hubspot_owner_id") or ""), "")
-        direction = first.get("hs_call_direction") or ""
-        outcome = dispositions.get(first.get("hs_call_disposition") or "", first.get("hs_call_disposition") or "") or (first.get("hs_call_status") or "")
+    # --- call-specific columns (unchanged meaning: they describe the first CALL) ---
+    if first_call:
+        hrs_call = business_hours_between(added_at, first_call["ts"])
+        first_call_at = fmt_dt(first_call["ts"])
+        call_owner = owners.get(str(first_call.get("hubspot_owner_id") or ""), "")
+        direction = first_call.get("hs_call_direction") or ""
+        outcome = dispositions.get(first_call.get("hs_call_disposition") or "", first_call.get("hs_call_disposition") or "") or (first_call.get("hs_call_status") or "")
     else:
-        hrs = ""
-        tier = tier_for(elapsed) if elapsed > 0 else TIER_AFTER_HOURS
-        status = "NOT CALLED"
+        hrs_call = ""
         first_call_at = call_owner = direction = outcome = ""
+
+    # --- status and tier are driven by the first outreach of either kind ---
+    if first:
+        hrs_out = business_hours_between(added_at, first["ts"])     # 0.0 when the outreach was inside the lookback window
+        tier = tier_for(hrs_out)
+        status = STATUS_CALLED if first_call else STATUS_EMAILED
+        outreach_at = fmt_dt(first["ts"])
+        outreach_by = (owners.get(str(first.get("hubspot_owner_id") or ""), "")
+                       or first.get("hs_email_from_email") or "")
+    else:
+        hrs_out = ""
+        tier = tier_for(elapsed) if elapsed > 0 else TIER_AFTER_HOURS
+        status = STATUS_OPEN
+        outreach_at = outreach_by = ""
 
     hs_rt = props.get("hs_time_to_first_engagement")
     hs_rt_hrs = round(int(hs_rt) / 3_600_000, 1) if hs_rt and str(hs_rt).lstrip("-").isdigit() else ""
@@ -503,16 +619,23 @@ def evaluate(contact_id: str, added_at: datetime, props: dict, owners: dict, dis
         "Call Direction": direction,
         "Call Outcome": outcome,
         "Calls After Lead": len(calls),
-        "Biz Hours To First Call": hrs,
+        "Biz Hours To First Call": hrs_call,
         "Biz Hours Elapsed": elapsed,
         "Tier": tier,
         "Status": status,
         "HS Lead Response Time (hrs)": hs_rt_hrs,
         "HubSpot Link": hs_link(contact_id),
         "Last Checked": fmt_dt(run_at),
+        "First Outreach": outreach_kind,
+        "First Outreach At": outreach_at,
+        "First Outreach By": outreach_by,
+        "Biz Hours To First Outreach": hrs_out,
+        "First Email At": fmt_dt(first_email["ts"]) if first_email else "",
+        "Emails After Lead": len(emails),
         # private keys for the email (never written to the sheet)
         "_added": added_at,
-        "_first_call": first["ts"] if first else None,
+        "_first_call": first_call["ts"] if first_call else None,
+        "_first_outreach": first["ts"] if first else None,
     }
 
 
@@ -551,6 +674,17 @@ def load_sheet_rows(ws):
         ws.freeze(rows=1)
         return {h: i for i, h in enumerate(SHEET_HEADERS)}, []
     header = values[0]
+    # If the script has grown new columns since this sheet was created, add them to the
+    # right of the existing header. Existing columns keep their position.
+    missing = [h for h in SHEET_HEADERS if h not in header]
+    if missing:
+        needed = len(header) + len(missing)
+        if ws.col_count < needed:
+            ws.add_cols(needed - ws.col_count)
+        ws.batch_update([{"range": f"{_col_letter(len(header) + 1)}1:{_col_letter(needed)}1", "values": [missing]}],
+                        value_input_option="USER_ENTERED")
+        log.info("Sheet: added %d new column(s): %s", len(missing), ", ".join(missing))
+        header = header + missing
     idx = {h: i for i, h in enumerate(header)}
     rows = []
     for n, raw in enumerate(values[1:], start=2):
@@ -570,7 +704,7 @@ def open_leads_from_sheet(rows, run_at: datetime):
     cutoff = run_at - timedelta(days=RECHECK_DAYS)
     carried, to_exclude = {}, []
     for n, d in rows:
-        if d.get("Status") != "NOT CALLED":
+        if d.get("Status") != STATUS_OPEN:
             continue
         added = parse_sheet_dt(d.get("Lead Added At", ""))
         cid = d.get("Contact ID", "").strip()
@@ -673,7 +807,7 @@ NOWRAP = "white-space:nowrap;"
 
 
 def _name_link(r) -> str:
-    return f"<a href='{r['HubSpot Link']}' style='color:{C_LINK};font-weight:bold;text-decoration:none'>{_esc(r['Name'])}</a>"
+    return f"<a href='{r['HubSpot Link']}' style='color:{C_HEADER_BG};font-weight:bold;text-decoration:none'>{_esc(r['Name'])}</a>"
 
 
 def _table(header_cells: str, body_rows: str) -> str:
@@ -713,15 +847,16 @@ def build_email(results: list, run_at: datetime, report_day: date) -> tuple:
     """
     cutoff = previous_business_close(report_day)
     today_rows = [r for r in results if r["_added"] > cutoff]
-    backlog = [r for r in results if r["_added"] <= cutoff and r["Status"] == "NOT CALLED"]
+    backlog = [r for r in results if r["_added"] <= cutoff and r["Status"] == STATUS_OPEN]
 
-    t_uncalled = [r for r in today_rows if r["Status"] == "NOT CALLED"]
-    t_late = [r for r in today_rows if r["Status"] == "CALLED" and r["Tier"] != TIER_OK]
-    t_ontime = [r for r in today_rows if r["Status"] == "CALLED" and r["Tier"] == TIER_OK]
+    reached = (STATUS_CALLED, STATUS_EMAILED)
+    t_uncalled = [r for r in today_rows if r["Status"] == STATUS_OPEN]
+    t_late = [r for r in today_rows if r["Status"] in reached and r["Tier"] != TIER_OK]
+    t_ontime = [r for r in today_rows if r["Status"] in reached and r["Tier"] == TIER_OK]
 
     day_label = report_day.strftime("%a %b %d")          # "Mon Nov 09"
     day_short = f"{report_day.month}/{report_day.day}"    # "11/9"
-    subject = f"Lead callback {day_short}: {len(t_uncalled)} not called, {len(t_late)} late, {len(backlog)} in backlog"
+    subject = f"Lead callback {day_short}: {len(t_uncalled)} no outreach, {len(t_late)} late, {len(backlog)} in backlog"
 
     parts = []
 
@@ -733,6 +868,7 @@ def build_email(results: list, run_at: datetime, report_day: date) -> tuple:
 
     # ---- header bar ----
     parts.append(f"<tr><td style='background:{C_HEADER_BG};padding:18px 22px;border-radius:8px 8px 0 0'>"
+                 f"<div style='font-size:11px;letter-spacing:2px;text-transform:uppercase;color:#C9D4E3;margin-bottom:4px;{FONT}'>{_esc(C_BRAND_NAME)}</div>"
                  f"<div style='font-size:20px;font-weight:bold;color:{C_HEADER_TEXT};{FONT}'>Lead Callback Check</div>"
                  f"<div style='font-size:13px;color:#C9D4E3;margin-top:3px;{FONT}'>Report for {_esc(day_label)}"
                  f" &nbsp;&middot;&nbsp; sent {_esc(fmt_short(run_at, True))}</div></td></tr>")
@@ -745,13 +881,13 @@ def build_email(results: list, run_at: datetime, report_day: date) -> tuple:
     parts.append("<tr><td><table width='100%' cellpadding='0' cellspacing='6' border='0'><tr>"
                  + _stat_tile(len(today_rows), "Leads in")
                  + _stat_tile(len(t_ontime), "On time", "#2E7D32")
-                 + _stat_tile(len(t_late), "Called late", "#EF6C00")
-                 + _stat_tile(len(t_uncalled), "Not called", "#C62828")
+                 + _stat_tile(len(t_late), "Late", "#EF6C00")
+                 + _stat_tile(len(t_uncalled), "No outreach", "#C62828")
                  + _stat_tile(len(backlog), "Backlog", "#6B7280")
                  + "</tr></table></td></tr>")
 
-    # ---- section 1a: not called, grouped by owner ----
-    parts.append(_section_title(f"{day_label}: not called yet", len(t_uncalled), "#C62828"))
+    # ---- section 1a: no outreach, grouped by owner ----
+    parts.append(_section_title(f"{day_label}: no outreach after form submitted", len(t_uncalled), "#C62828"))
     if t_uncalled:
         by_owner = {}
         for r in t_uncalled:
@@ -766,33 +902,44 @@ def build_email(results: list, run_at: datetime, report_day: date) -> tuple:
         parts.append("<tr><td>" + _table(_th("Name") + _th("Phone") + _th("Came in")
                                         + _th("Hrs waiting", "right") + _th("Tier", "center"), body) + "</td></tr>")
     else:
-        parts.append(f"<tr><td style='padding:6px 10px;font-size:13px;color:{C_MUTED};{FONT}'>Everyone got a call. Nice.</td></tr>")
+        parts.append(f"<tr><td style='padding:6px 10px;font-size:13px;color:{C_MUTED};{FONT}'>Every lead got a first outreach. Nice.</td></tr>")
 
-    # ---- section 1b: called late ----
-    parts.append(_section_title(f"{day_label}: called, but late", len(t_late), "#EF6C00"))
+    # ---- section 1b: first outreach was late ----
+    parts.append(_section_title(f"{day_label}: first outreach after form submitted was late", len(t_late), "#EF6C00"))
     if t_late:
         body = ""
-        for r in sorted(t_late, key=lambda r: -float(r["Biz Hours To First Call"] or 0)):
+        for r in sorted(t_late, key=lambda r: -float(r["Biz Hours To First Outreach"] or 0)):
+            outreach = f"<b>{_esc(r['First Outreach'])}</b> {_esc(fmt_short(r['_first_outreach']))}"   # "Call Mon 4:05pm"
             body += ("<tr>" + _cell(_name_link(r), extra=NOWRAP) + _cell(_esc(r["Contact Owner"]), extra=NOWRAP)
-                     + _cell(_esc(fmt_short(r["_added"])), extra=NOWRAP) + _cell(_esc(fmt_short(r["_first_call"])), extra=NOWRAP)
-                     + _cell(_hrs(r["Biz Hours To First Call"]), "right") + _cell(_pill(r["Tier"]), "center") + "</tr>")
-        parts.append("<tr><td>" + _table(_th("Name") + _th("Owner") + _th("Came in") + _th("First call")
-                                        + _th("Hrs to call", "right") + _th("Tier", "center"), body) + "</td></tr>")
+                     + _cell(_esc(fmt_short(r["_added"])), extra=NOWRAP) + _cell(outreach, extra=NOWRAP)
+                     + _cell(_hrs(r["Biz Hours To First Outreach"]), "right") + _cell(_pill(r["Tier"]), "center") + "</tr>")
+        parts.append("<tr><td>" + _table(_th("Name") + _th("Owner") + _th("Came in") + _th("First outreach")
+                                        + _th("Hrs to outreach", "right") + _th("Tier", "center"), body) + "</td></tr>")
     else:
         parts.append(f"<tr><td style='padding:6px 10px;font-size:13px;color:{C_MUTED};{FONT}'>None.</td></tr>")
 
     # ---- section 1c: on time, one line ----
     if t_ontime:
-        by_owner = {}
+        by_owner = {}                                   # owner -> {"Call": n, "Email": n}
         for r in t_ontime:
-            by_owner[r["Contact Owner"]] = by_owner.get(r["Contact Owner"], 0) + 1
-        line = ", ".join(f"{_esc(o)} ({n})" for o, n in sorted(by_owner.items()))
+            kinds = by_owner.setdefault(r["Contact Owner"], {"Call": 0, "Email": 0})
+            kinds[r["First Outreach"] or "Call"] += 1
+
+        def _how(k):                                    # "2 calls", "1 call, 1 email"
+            bits = []
+            if k["Call"]:
+                bits.append(f"{k['Call']} call" + ("s" if k["Call"] != 1 else ""))
+            if k["Email"]:
+                bits.append(f"{k['Email']} email" + ("s" if k["Email"] != 1 else ""))
+            return ", ".join(bits)
+
+        line = "; ".join(f"{_esc(o)} ({_how(k)})" for o, k in sorted(by_owner.items()))
         parts.append(f"<tr><td style='padding:14px 10px 0;font-size:13px;color:{C_TEXT};{FONT}'>"
-                     f"<span style='color:#2E7D32;font-weight:bold'>Called within the hour:</span> {line}</td></tr>")
+                     f"<span style='color:#2E7D32;font-weight:bold'>First outreach within the hour:</span> {line}</td></tr>")
 
     # ---- section 2: backlog ----
     parts.append(f"<tr><td style='padding-top:22px'><hr style='border:0;border-top:1px solid {C_LINE};margin:0'></td></tr>")
-    parts.append(_section_title(f"Still not called from before {day_short}", len(backlog), C_TEXT))
+    parts.append(_section_title(f"Still no outreach from before {day_short}", len(backlog), C_TEXT))
     if backlog:
         body = ""
         for r in sorted(backlog, key=lambda r: r["_added"]):
@@ -808,7 +955,9 @@ def build_email(results: list, run_at: datetime, report_day: date) -> tuple:
     sheet_link = f" &nbsp;&middot;&nbsp; <a href='{SHEET_URL}' style='color:{C_LINK}'>Open the sheet</a>" if SHEET_URL else ""
     excl = f" Excluded: {_esc(', '.join(EXCLUDE_FORMS))}." if EXCLUDE_FORMS else ""
     parts.append(f"<tr><td style='padding-top:22px;font-size:11px;color:{C_MUTED};line-height:1.5;{FONT}'>"
-                 f"Lead time is the moment the contact joined the HubSpot list. A call is any call logged on the contact after that. "
+                 f"Lead time is the moment the contact joined the HubSpot list. First outreach is the first call or one-to-one email "
+                 f"from a CF1 user logged on the contact, starting {LOOKBACK_MINUTES} minutes before the lead time. "
+                 f"Sequence and marketing emails do not count. "
                  f"Hours count Mon-Fri {BUSINESS_START}:00-{BUSINESS_END}:00 {_esc(TZ.key)} only; weekend and after-hours leads "
                  f"start their clock at the next open. Tiers: On time &lt;1h, Flag 1 1-3h, Flag 2 3h+, Flag 3 1+ business day.{excl}"
                  f"{sheet_link}</td></tr>")
@@ -899,13 +1048,16 @@ def main():
             continue
         results.append(r)
         time.sleep(0.25)
-    log.info("%d leads evaluated, %d excluded by EXCLUDE_FORMS, %d not called",
-             len(results), excluded, sum(1 for r in results if r["Status"] == "NOT CALLED"))
+    log.info("%d leads evaluated, %d excluded by EXCLUDE_FORMS, %d called, %d emailed only, %d no outreach",
+             len(results), excluded,
+             sum(1 for r in results if r["Status"] == STATUS_CALLED),
+             sum(1 for r in results if r["Status"] == STATUS_EMAILED),
+             sum(1 for r in results if r["Status"] == STATUS_OPEN))
 
     # 5. Output
     if DRY_RUN:
-        cols = ["Name", "Contact Owner", "Lead Added At", "Form / Event", "First Call At",
-                "Biz Hours To First Call", "Biz Hours Elapsed", "Tier", "Status"]
+        cols = ["Name", "Contact Owner", "Lead Added At", "First Outreach", "First Outreach At",
+                "Biz Hours To First Outreach", "First Call At", "First Email At", "Biz Hours Elapsed", "Tier", "Status"]
         print("\t".join(cols))
         for r in results:
             print("\t".join(str(r.get(c, "")) for c in cols))
